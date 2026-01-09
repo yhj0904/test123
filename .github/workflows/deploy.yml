@@ -1,0 +1,211 @@
+name: React App CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. 빌드 단계
+  build:
+    name: 빌드
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 소스 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Node.js 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 의존성 설치
+        run: |
+          echo "📦 의존성 설치 중 (Clean Install)..."
+          npm ci
+
+      - name: 빌드 실행
+        run: |
+          echo "🔨 프로젝트 빌드 중..."
+          npm run build
+
+      - name: 빌드 결과물 확인
+        run: |
+          echo "✅ 빌드 완료!"
+          echo "📁 dist 디렉토리 내용:"
+          ls -la dist/
+          echo "📊 빌드 크기:"
+          du -sh dist/
+
+      - name: 빌드 아티팩트 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-files
+          path: dist/
+          retention-days: 1
+
+  # 2. 테스트 단계
+  test:
+    name: 테스트
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: 소스 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Node.js 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 의존성 설치
+        run: npm ci
+
+      - name: 린트 검사
+        run: |
+          echo "🔍 코드 스타일 검사 중..."
+          npm run lint
+
+      - name: 단위 테스트 실행
+        run: |
+          echo "🧪 테스트 실행 중..."
+          npm test -- --watchAll=false
+
+      - name: 빌드 아티팩트 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-files
+          path: ./dist
+
+      - name: 빌드 파일 검증
+        run: |
+          echo "🔍 빌드 파일 검증 중..."
+          test -f dist/index.html || (echo "❌ index.html이 없습니다!" && exit 1)
+          echo "✅ 빌드 파일 검증 완료"
+
+  # 3. 배포 단계
+  deploy:
+    name: 배포
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: 빌드 아티팩트 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-files
+          path: dist
+      - name: SCP files to Nginx Server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.NGINX_PRIVATE_IP }} # 목적지: Nginx 내부 IP
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}       # Nginx 서버 접속용 키
+          proxy_host: ${{ secrets.BASTION_IP }} # 경유지: Bastion 공인 IP
+          proxy_username: ubuntu
+          proxy_key: ${{ secrets.EC2_SSH_KEY }} # Bastion 접속용 키
+          source: "dist/*" 
+          target: "/home/ubuntu/react_temp"
+          strip_components: 1
+
+      # 2. SSH를 통해 Nginx 서버에서 파일 이동 작업 수행
+      - name: Finalize Deployment on Nginx Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.NGINX_PRIVATE_IP }} # 목적지: Nginx 내부 IP
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          proxy_host: ${{ secrets.BASTION_IP }} # 경유지: Bastion 공인 IP
+          proxy_username: ubuntu
+          proxy_key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 1. 대상 디렉토리 권한 확보
+            sudo mkdir -p /var/www/react
+            sudo chown -R ubuntu:ubuntu /var/www/react
+            
+            # 2. 기존 파일 교체
+            rm -rf /var/www/react/*
+            cp -r /home/ubuntu/react_temp/* /var/www/react/
+            
+            # 3. 임시 파일 삭제 및 Nginx 반영
+            rm -rf /home/ubuntu/react_temp
+            sudo systemctl reload nginx
+            echo "Deployment Successful!"
+
+  # 4. 알림 단계 (선택사항)
+  notify:
+    name: 알림
+    runs-on: ubuntu-latest
+    needs: [build, test, deploy]
+    if: always()
+
+    steps:
+      - name: 작업 상태 확인
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "message=배포 성공" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy.result }}" == "skipped" ]; then
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "emoji=⏭️" >> $GITHUB_OUTPUT
+            echo "message=배포 건너뜀 (PR 또는 다른 브랜치)" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "message=배포 실패" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Slack 알림
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} *React App 배포 상태*",
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.status == 'success' && 'good' || steps.status.outputs.status == 'skipped' && 'warning' || 'danger' }}",
+                  "fields": [
+                    {
+                      "title": "상태",
+                      "value": "${{ steps.status.outputs.message }}",
+                      "short": true
+                    },
+                    {
+                      "title": "브랜치",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "커밋",
+                      "value": "`${{ github.sha }}`",
+                      "short": false
+                    },
+                    {
+                      "title": "실행자",
+                      "value": "${{ github.actor }}",
+                      "short": true
+                    },
+                    {
+                      "title": "워크플로우",
+                      "value": "${{ github.workflow }}",
+                      "short": true
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
